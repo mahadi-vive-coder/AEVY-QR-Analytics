@@ -96,6 +96,7 @@ export interface StorageHealth {
   app_url_status: 'configured' | 'missing' | 'dev_warning';
   gcs_sync_enabled: boolean;
   gcs_bucket: string | null;
+  blob_storage_enabled?: boolean;
 }
 
 export interface AppSettings {

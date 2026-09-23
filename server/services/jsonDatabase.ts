@@ -2,6 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 import bcrypt from 'bcryptjs';
+import { put, get, list, del } from '@vercel/blob';
 import { isDevOrLocalUrl } from './urlService.js';
 
 // Types
@@ -89,9 +90,9 @@ export interface AppSettings {
   default_background: string;
   default_accent: string;
   default_destination: string;
-  app_url: string; // The production dynamic QR base URL (e.g. https://qr.aevyfragrance.com)
+  app_url: string;
   ip_salt: string;
-  data_retention_days: number; // 0 = never
+  data_retention_days: number;
   anonymize_ip: boolean;
   enable_lead_capture: boolean;
 }
@@ -120,9 +121,10 @@ export interface StorageHealthReport {
   app_url_status: 'configured' | 'missing' | 'dev_warning';
   gcs_sync_enabled: boolean;
   gcs_bucket: string | null;
+  blob_storage_enabled?: boolean;
 }
 
-// In-memory write lock queue to guarantee atomic sequential writes without file race conditions
+// In-memory write lock queue for atomic sequential writes (local file mode fallback)
 class WriteLockQueue {
   private queue: Promise<void> = Promise.resolve();
   private pendingTasks = 0;
@@ -148,13 +150,20 @@ class WriteLockQueue {
 
 const writeLock = new WriteLockQueue();
 
-// Resolve persistent data directory (supports Cloud Run volume mounts like /mnt/data or custom DATA_DIR)
+// Check if Vercel Blob credentials are provided (either explicit token or automatic Vercel OIDC)
+export function isBlobStorageConfigured(): boolean {
+  return Boolean(
+    process.env.BLOB_READ_WRITE_TOKEN ||
+    process.env.VERCEL_OIDC_TOKEN ||
+    process.env.VERCEL_BLOB_STORE_ID ||
+    (process.env.VERCEL && process.env.VERCEL_ENV)
+  );
+}
+
+// Resolve persistent local data directory for fallback/development
 function resolveDataDirectory(): string {
   if (process.env.DATA_DIR && process.env.DATA_DIR.trim()) {
     return path.resolve(process.env.DATA_DIR.trim());
-  }
-  if (fs.existsSync('/mnt/data')) {
-    return '/mnt/data';
   }
   return path.resolve(process.cwd(), 'data');
 }
@@ -164,16 +173,16 @@ export class JsonDatabase {
   private dataDir: string;
   private lastSuccessfulWrite: string | null = null;
   private storageStatus: 'Connected' | 'Error' = 'Connected';
-  private gcsBucketName: string | null = null;
-  private gcsBucket: any = null;
 
   private constructor() {
     this.dataDir = resolveDataDirectory();
-    this.gcsBucketName = process.env.GCS_BUCKET || process.env.STORAGE_BUCKET || process.env.GCS_DATA_BUCKET || null;
 
-    this.ensureDataDir();
-    this.initDefaultFiles();
-    this.initGcsSync();
+    // If Blob credentials are NOT configured, ensure local fallback data directory & files
+    if (!isBlobStorageConfigured()) {
+      this.ensureLocalDataDir();
+      this.initDefaultLocalFiles();
+    }
+
     this.migrateExistingQRCodes().catch((err) => {
       console.error('[JsonDatabase] Migration error on startup:', err);
     });
@@ -186,75 +195,38 @@ export class JsonDatabase {
     return JsonDatabase.instance;
   }
 
-  private ensureDataDir() {
+  // --- Local Filesystem Fallback Helpers ---
+
+  private ensureLocalDataDir() {
     try {
       if (!fs.existsSync(this.dataDir)) {
         fs.mkdirSync(this.dataDir, { recursive: true });
       }
       this.storageStatus = 'Connected';
     } catch (err) {
-      console.error(`[JsonDatabase] Failed to ensure data dir at ${this.dataDir}:`, err);
+      console.error(`[JsonDatabase] Failed to ensure local data dir at ${this.dataDir}:`, err);
       this.storageStatus = 'Error';
     }
   }
 
-  private async initGcsSync() {
-    if (!this.gcsBucketName) return;
-    try {
-      const { Storage } = await import('@google-cloud/storage');
-      const storage = new Storage();
-      this.gcsBucket = storage.bucket(this.gcsBucketName);
-      console.log(`[JsonDatabase] Persistent GCS Bucket configured: ${this.gcsBucketName}`);
-
-      // Attempt to pull persistent JSON from bucket if local directory has missing files
-      const filesToCheck = ['qr_codes.json', 'scans.json', 'campaigns.json', 'visitors.json', 'settings.json'];
-      for (const fname of filesToCheck) {
-        const localPath = this.getFilePath(fname);
-        if (!fs.existsSync(localPath)) {
-          try {
-            const file = this.gcsBucket.file(fname);
-            const [exists] = await file.exists();
-            if (exists) {
-              console.log(`[JsonDatabase] Restoring ${fname} from Cloud Storage bucket...`);
-              await file.download({ destination: localPath });
-            }
-          } catch (dlErr) {
-            console.warn(`[JsonDatabase] Cloud Storage check for ${fname} note:`, dlErr);
-          }
-        }
-      }
-    } catch (err) {
-      console.warn('[JsonDatabase] Optional GCS sync initialization skipped:', err);
-    }
-  }
-
-  private getFilePath(filename: string): string {
+  private getLocalFilePath(filename: string): string {
     return path.join(this.dataDir, filename);
   }
 
-  private initDefaultFiles() {
-    // 1. qr_codes.json
-    if (!fs.existsSync(this.getFilePath('qr_codes.json'))) {
-      this.writeSync('qr_codes.json', []);
+  private initDefaultLocalFiles() {
+    if (!fs.existsSync(this.getLocalFilePath('qr_codes.json'))) {
+      this.writeLocalSync('qr_codes.json', []);
     }
-
-    // 2. scans.json
-    if (!fs.existsSync(this.getFilePath('scans.json'))) {
-      this.writeSync('scans.json', []);
+    if (!fs.existsSync(this.getLocalFilePath('scans.json'))) {
+      this.writeLocalSync('scans.json', []);
     }
-
-    // 3. campaigns.json
-    if (!fs.existsSync(this.getFilePath('campaigns.json'))) {
-      this.writeSync('campaigns.json', []);
+    if (!fs.existsSync(this.getLocalFilePath('campaigns.json'))) {
+      this.writeLocalSync('campaigns.json', []);
     }
-
-    // 4. visitors.json
-    if (!fs.existsSync(this.getFilePath('visitors.json'))) {
-      this.writeSync('visitors.json', []);
+    if (!fs.existsSync(this.getLocalFilePath('visitors.json'))) {
+      this.writeLocalSync('visitors.json', []);
     }
-
-    // 5. settings.json
-    if (!fs.existsSync(this.getFilePath('settings.json'))) {
+    if (!fs.existsSync(this.getLocalFilePath('settings.json'))) {
       const defaultSettings: AppSettings = {
         business_name: 'AEVY',
         tagline: 'Essence of Fresh Elegance',
@@ -269,11 +241,9 @@ export class JsonDatabase {
         anonymize_ip: true,
         enable_lead_capture: true,
       };
-      this.writeSync('settings.json', defaultSettings);
+      this.writeLocalSync('settings.json', defaultSettings);
     }
-
-    // 6. admin.json
-    if (!fs.existsSync(this.getFilePath('admin.json'))) {
+    if (!fs.existsSync(this.getLocalFilePath('admin.json'))) {
       const defaultEmail = process.env.ADMIN_EMAIL || 'aevy.brand@gmail.com';
       const defaultPassword = process.env.ADMIN_PASSWORD || 'aevy2026!';
       const salt = bcrypt.genSaltSync(10);
@@ -288,13 +258,12 @@ export class JsonDatabase {
           created_at: new Date().toISOString(),
         },
       ];
-      this.writeSync('admin.json', defaultAdmin);
+      this.writeLocalSync('admin.json', defaultAdmin);
     }
   }
 
-  // Atomic file write using a temporary file and atomic rename
-  private writeSync(filename: string, data: any) {
-    const targetPath = this.getFilePath(filename);
+  private writeLocalSync(filename: string, data: any) {
+    const targetPath = this.getLocalFilePath(filename);
     const tempPath = `${targetPath}.${Date.now()}.${Math.random().toString(36).substring(2)}.tmp`;
     const jsonString = JSON.stringify(data, null, 2);
     fs.writeFileSync(tempPath, jsonString, 'utf-8');
@@ -303,53 +272,115 @@ export class JsonDatabase {
     this.storageStatus = 'Connected';
   }
 
-  private async writeAtomic<T>(filename: string, data: T): Promise<void> {
+  private async writeLocalAtomic<T>(filename: string, data: T): Promise<void> {
     return writeLock.enqueue(async () => {
       try {
-        const targetPath = this.getFilePath(filename);
+        const targetPath = this.getLocalFilePath(filename);
         const tempPath = `${targetPath}.${Date.now()}.${Math.random().toString(36).substring(2)}.tmp`;
         const jsonString = JSON.stringify(data, null, 2);
         await fs.promises.writeFile(tempPath, jsonString, 'utf-8');
         await fs.promises.rename(tempPath, targetPath);
         this.lastSuccessfulWrite = new Date().toISOString();
         this.storageStatus = 'Connected';
-
-        // Secondary asynchronous persistent GCS sync if bucket is enabled
-        if (this.gcsBucket) {
-          this.gcsBucket
-            .upload(targetPath, { destination: filename })
-            .catch((gcsErr: any) => {
-              console.warn(`[JsonDatabase] GCS background sync note for ${filename}:`, gcsErr?.message);
-            });
-        }
       } catch (err) {
         this.storageStatus = 'Error';
-        console.error(`[JsonDatabase] Error in writeAtomic for ${filename}:`, err);
+        console.error(`[JsonDatabase] Error in writeLocalAtomic for ${filename}:`, err);
         throw err;
       }
     });
   }
 
-  private async read<T>(filename: string, fallback: T): Promise<T> {
+  private async readLocal<T>(filename: string, fallback: T): Promise<T> {
     try {
-      const filePath = this.getFilePath(filename);
+      const filePath = this.getLocalFilePath(filename);
       if (!fs.existsSync(filePath)) {
         return fallback;
       }
       const raw = await fs.promises.readFile(filePath, 'utf-8');
       return JSON.parse(raw) as T;
     } catch (err) {
-      console.error(`[JsonDatabase] Error reading ${filename}:`, err);
+      console.error(`[JsonDatabase] Error reading local ${filename}:`, err);
       return fallback;
     }
   }
 
+  // --- Vercel Blob Read / Write Primitives ---
+
   /**
-   * Migration / Compatibility Mechanism for existing QR codes:
-   * 1. Strips any hardcoded 'tracking_url' or 'url' properties from QR database records
-   * 2. Enforces clean schema: stores ONLY the QR ID and QR configuration
-   * 3. Preserves all existing QR IDs (e.g. AEVY-QR-000004) and historical scan records
+   * Reads a JSON object from private Vercel Blob with useCache: false.
+   * If blob does not exist or credentials are unavailable, returns null.
    */
+  private async readBlobJson<T>(blobPath: string): Promise<T | null> {
+    if (!isBlobStorageConfigured()) {
+      return null;
+    }
+    try {
+      const result = await get(blobPath, { access: 'private', useCache: false });
+      if (!result || result.statusCode !== 200 || !result.stream) {
+        return null;
+      }
+
+      // Read Web ReadableStream into string
+      const reader = result.stream.getReader();
+      const chunks: Uint8Array[] = [];
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value) chunks.push(value);
+      }
+      const buffer = Buffer.concat(chunks);
+      const text = buffer.toString('utf-8');
+      return JSON.parse(text) as T;
+    } catch (err: any) {
+      if (err.name === 'BlobNotFoundError' || err.message?.includes('not found') || err.message?.includes('404')) {
+        return null;
+      }
+      console.warn(`[JsonDatabase] Note reading blob ${blobPath}:`, err.message);
+      return null;
+    }
+  }
+
+  /**
+   * Writes a JSON object to private Vercel Blob.
+   */
+  private async writeBlobJson<T>(blobPath: string, data: T): Promise<void> {
+    const jsonString = JSON.stringify(data, null, 2);
+    await put(blobPath, jsonString, {
+      access: 'private',
+      contentType: 'application/json',
+      addRandomSuffix: false,
+      allowOverwrite: true,
+      cacheControlMaxAge: 60,
+    });
+    this.lastSuccessfulWrite = new Date().toISOString();
+    this.storageStatus = 'Connected';
+  }
+
+  // Unified Read / Write routing: Blob when configured, fallback to Local JSON
+  private async readData<T>(filename: string, fallback: T): Promise<T> {
+    if (isBlobStorageConfigured()) {
+      const blobPath = `data/${filename}`;
+      const blobData = await this.readBlobJson<T>(blobPath);
+      if (blobData !== null) {
+        return blobData;
+      }
+      // If blob was not found yet, check local file (useful during local migration / transition)
+      const localData = await this.readLocal<T>(filename, fallback);
+      return localData;
+    }
+    return this.readLocal<T>(filename, fallback);
+  }
+
+  private async writeData<T>(filename: string, data: T): Promise<void> {
+    if (isBlobStorageConfigured()) {
+      const blobPath = `data/${filename}`;
+      await this.writeBlobJson(blobPath, data);
+      return;
+    }
+    await this.writeLocalAtomic(filename, data);
+  }
+
+  // --- Migration Existing QR Codes Clean-up ---
   public async migrateExistingQRCodes(): Promise<{ migratedCount: number; cleanedFields: string[] }> {
     const qrs = await this.getQRCodes();
     let changed = false;
@@ -360,7 +391,6 @@ export class JsonDatabase {
       let itemChanged = false;
       const cleaned: any = { ...item };
 
-      // Requirement 3: Do NOT store a permanently hardcoded tracking URL inside the QR database record.
       if (cleaned.tracking_url !== undefined) {
         delete cleaned.tracking_url;
         cleanedFields.add('tracking_url');
@@ -386,7 +416,7 @@ export class JsonDatabase {
 
     if (changed) {
       await this.saveQRCodes(migrated);
-      console.log(`[JsonDatabase] Migration complete: Cleaned ${count} existing QR records.`);
+      console.log(`[JsonDatabase] Cleaned ${count} existing QR records.`);
     }
 
     return { migratedCount: count, cleanedFields: Array.from(cleanedFields) };
@@ -394,7 +424,7 @@ export class JsonDatabase {
 
   // --- QR Codes ---
   public async getQRCodes(): Promise<QRCodeItem[]> {
-    return this.read<QRCodeItem[]>('qr_codes.json', []);
+    return this.readData<QRCodeItem[]>('qr_codes.json', []);
   }
 
   public async getQRCodeById(id: string): Promise<QRCodeItem | null> {
@@ -403,7 +433,7 @@ export class JsonDatabase {
   }
 
   public async saveQRCodes(items: QRCodeItem[]): Promise<void> {
-    await this.writeAtomic('qr_codes.json', items);
+    await this.writeData('qr_codes.json', items);
   }
 
   public async generateNextQRId(): Promise<string> {
@@ -421,7 +451,6 @@ export class JsonDatabase {
   }
 
   public async createQRCode(item: QRCodeItem): Promise<QRCodeItem> {
-    // Ensure no hardcoded tracking_url is stored in the database record
     const recordToSave: any = { ...item };
     delete recordToSave.tracking_url;
     delete recordToSave.trackingUrl;
@@ -471,30 +500,109 @@ export class JsonDatabase {
   }
 
   // --- Scans ---
+  /**
+   * Retrieves all scan records.
+   * In Vercel Blob mode:
+   * 1. Lists all individual scan files under prefix `data/scans/` and fetches each scan JSON concurrently.
+   * 2. If no individual scan objects exist, checks legacy/migrated `data/scans.json` blob.
+   * In local fallback mode: Reads local `scans.json`.
+   */
   public async getScans(): Promise<ScanItem[]> {
-    return this.read<ScanItem[]>('scans.json', []);
+    if (isBlobStorageConfigured()) {
+      try {
+        // 1. List individual scans under data/scans/
+        const blobList = await list({ prefix: 'data/scans/', limit: 1000 });
+        const jsonBlobs = blobList.blobs.filter(
+          (b) => b.pathname.endsWith('.json') && !b.pathname.endsWith('scans.json')
+        );
+
+        if (jsonBlobs.length > 0) {
+          // Fetch immutable individual scans concurrently in batches
+          const batchSize = 25;
+          const scans: ScanItem[] = [];
+          for (let i = 0; i < jsonBlobs.length; i += batchSize) {
+            const batch = jsonBlobs.slice(i, i + batchSize);
+            const batchResults = await Promise.all(
+              batch.map((b) => this.readBlobJson<ScanItem>(b.pathname))
+            );
+            for (const item of batchResults) {
+              if (item && item.scan_id) {
+                scans.push(item);
+              }
+            }
+          }
+
+          // Also check if there are legacy scans in data/scans.json not yet migrated to individual files
+          const legacyScans = (await this.readBlobJson<ScanItem[]>('data/scans.json')) || [];
+          const existingIds = new Set(scans.map((s) => s.scan_id));
+          for (const s of legacyScans) {
+            if (!existingIds.has(s.scan_id)) {
+              scans.push(s);
+            }
+          }
+
+          scans.sort((a, b) => (b.timestamp || '').localeCompare(a.timestamp || ''));
+          return scans;
+        }
+
+        // 2. Fallback to monolithic blob `data/scans.json`
+        const monolithic = await this.readBlobJson<ScanItem[]>('data/scans.json');
+        if (monolithic && Array.isArray(monolithic)) {
+          return monolithic;
+        }
+      } catch (err: any) {
+        console.warn('[JsonDatabase] Note reading scans from Vercel Blob:', err.message);
+      }
+    }
+
+    return this.readLocal<ScanItem[]>('scans.json', []);
   }
 
+  /**
+   * Records a new scan.
+   * In Vercel Blob mode:
+   * Writes the scan event to an immutable blob path: `data/scans/YYYY-MM-DD/<scan-id>.json`.
+   * This completely avoids concurrency race conditions and read-modify-write conflicts in serverless functions.
+   * In local fallback mode:
+   * Appends to `scans.json` using the local write lock queue.
+   */
   public async recordScan(scan: ScanItem): Promise<void> {
+    if (isBlobStorageConfigured()) {
+      const datePart = scan.date || new Date().toISOString().split('T')[0];
+      const scanBlobPath = `data/scans/${datePart}/${scan.scan_id}.json`;
+      await this.writeBlobJson(scanBlobPath, scan);
+      // Increment scan count on the QR code
+      await this.incrementScanCount(scan.qr_id, scan.timestamp);
+      return;
+    }
+
     const scans = await this.getScans();
     scans.push(scan);
-    await this.writeAtomic('scans.json', scans);
+    await this.writeLocalAtomic('scans.json', scans);
     await this.incrementScanCount(scan.qr_id, scan.timestamp);
   }
 
   public async generateNextScanId(): Promise<string> {
     const scans = await this.getScans();
-    const nextNum = scans.length + 1;
+    let maxNum = 0;
+    for (const item of scans) {
+      const match = item.scan_id?.match(/^SCAN-(\d+)$/i);
+      if (match) {
+        const n = parseInt(match[1], 10);
+        if (n > maxNum) maxNum = n;
+      }
+    }
+    const nextNum = Math.max(scans.length + 1, maxNum + 1);
     return `SCAN-${String(nextNum).padStart(6, '0')}`;
   }
 
   // --- Campaigns ---
   public async getCampaigns(): Promise<CampaignItem[]> {
-    return this.read<CampaignItem[]>('campaigns.json', []);
+    return this.readData<CampaignItem[]>('campaigns.json', []);
   }
 
   public async saveCampaigns(items: CampaignItem[]): Promise<void> {
-    await this.writeAtomic('campaigns.json', items);
+    await this.writeData('campaigns.json', items);
   }
 
   public async generateNextCampaignId(): Promise<string> {
@@ -537,24 +645,33 @@ export class JsonDatabase {
 
   // --- Visitors / Leads ---
   public async getVisitors(): Promise<VisitorLeadItem[]> {
-    return this.read<VisitorLeadItem[]>('visitors.json', []);
+    return this.readData<VisitorLeadItem[]>('visitors.json', []);
   }
 
   public async recordVisitorLead(lead: VisitorLeadItem): Promise<VisitorLeadItem> {
     const list = await this.getVisitors();
     list.unshift(lead);
-    await this.writeAtomic('visitors.json', list);
+    await this.writeData('visitors.json', list);
     return lead;
   }
 
   public async generateNextLeadId(): Promise<string> {
     const list = await this.getVisitors();
-    return `LEAD-${String(list.length + 1).padStart(6, '0')}`;
+    let maxNum = 0;
+    for (const item of list) {
+      const match = item.lead_id?.match(/^LEAD-(\d+)$/i);
+      if (match) {
+        const n = parseInt(match[1], 10);
+        if (n > maxNum) maxNum = n;
+      }
+    }
+    const nextNum = Math.max(list.length + 1, maxNum + 1);
+    return `LEAD-${String(nextNum).padStart(6, '0')}`;
   }
 
   // --- Settings ---
   public async getSettings(): Promise<AppSettings> {
-    const raw = await this.read<AppSettings>('settings.json', {
+    const defaultSettings: AppSettings = {
       business_name: 'AEVY',
       tagline: 'Essence of Fresh Elegance',
       timezone: 'Asia/Dhaka',
@@ -567,7 +684,9 @@ export class JsonDatabase {
       data_retention_days: 0,
       anonymize_ip: true,
       enable_lead_capture: true,
-    });
+    };
+
+    const raw = await this.readData<AppSettings>('settings.json', defaultSettings);
 
     if (!raw.app_url) {
       raw.app_url = 'https://qr.aevyfragrance.com';
@@ -579,17 +698,127 @@ export class JsonDatabase {
   public async updateSettings(updates: Partial<AppSettings>): Promise<AppSettings> {
     const current = await this.getSettings();
     const updated = { ...current, ...updates };
-    await this.writeAtomic('settings.json', updated);
+    await this.writeData('settings.json', updated);
     return updated;
   }
 
   // --- Admin Accounts ---
   public async getAdmins(): Promise<AdminAccount[]> {
-    return this.read<AdminAccount[]>('admin.json', []);
+    return this.readData<AdminAccount[]>('admin.json', []);
   }
 
   public async saveAdmins(admins: AdminAccount[]): Promise<void> {
-    await this.writeAtomic('admin.json', admins);
+    await this.writeData('admin.json', admins);
+  }
+
+  // --- One-Time Migration Utility (Triggered when MIGRATION_MODE=true) ---
+  public async migrateLocalJsonToBlob(): Promise<{
+    migrated: boolean;
+    message: string;
+    filesMigrated: string[];
+    counts: {
+      qrCodes: number;
+      scans: number;
+      campaigns: number;
+      visitors: number;
+      settings: boolean;
+      admin: boolean;
+    };
+  }> {
+    if (!isBlobStorageConfigured()) {
+      return {
+        migrated: false,
+        message: 'Vercel Blob credentials (BLOB_READ_WRITE_TOKEN or automatic Vercel OIDC) not configured.',
+        filesMigrated: [],
+        counts: { qrCodes: 0, scans: 0, campaigns: 0, visitors: 0, settings: false, admin: false },
+      };
+    }
+
+    // Check if Blob already has existing data (idempotency check)
+    const existingQrs = await this.readBlobJson<QRCodeItem[]>('data/qr_codes.json');
+    if (existingQrs && existingQrs.length > 0) {
+      return {
+        migrated: false,
+        message: 'Vercel Blob already contains production data (qr_codes.json exists). Migration skipped to prevent overwrite.',
+        filesMigrated: [],
+        counts: { qrCodes: existingQrs.length, scans: 0, campaigns: 0, visitors: 0, settings: true, admin: true },
+      };
+    }
+
+    const filesMigrated: string[] = [];
+    const counts = {
+      qrCodes: 0,
+      scans: 0,
+      campaigns: 0,
+      visitors: 0,
+      settings: false,
+      admin: false,
+    };
+
+    console.log('[Migration] Starting migration from local JSON files to Vercel Blob...');
+
+    // 1. QR Codes
+    const localQrs = await this.readLocal<QRCodeItem[]>('qr_codes.json', []);
+    if (localQrs.length > 0) {
+      await this.writeBlobJson('data/qr_codes.json', localQrs);
+      filesMigrated.push('qr_codes.json');
+      counts.qrCodes = localQrs.length;
+    }
+
+    // 2. Campaigns
+    const localCampaigns = await this.readLocal<CampaignItem[]>('campaigns.json', []);
+    if (localCampaigns.length > 0) {
+      await this.writeBlobJson('data/campaigns.json', localCampaigns);
+      filesMigrated.push('campaigns.json');
+      counts.campaigns = localCampaigns.length;
+    }
+
+    // 3. Visitors
+    const localVisitors = await this.readLocal<VisitorLeadItem[]>('visitors.json', []);
+    if (localVisitors.length > 0) {
+      await this.writeBlobJson('data/visitors.json', localVisitors);
+      filesMigrated.push('visitors.json');
+      counts.visitors = localVisitors.length;
+    }
+
+    // 4. Settings
+    const localSettings = await this.readLocal<AppSettings | null>('settings.json', null);
+    if (localSettings) {
+      await this.writeBlobJson('data/settings.json', localSettings);
+      filesMigrated.push('settings.json');
+      counts.settings = true;
+    }
+
+    // 5. Admin
+    const localAdmin = await this.readLocal<AdminAccount[]>('admin.json', []);
+    if (localAdmin.length > 0) {
+      await this.writeBlobJson('data/admin.json', localAdmin);
+      filesMigrated.push('admin.json');
+      counts.admin = true;
+    }
+
+    // 6. Scans (migrated as immutable per-scan event files under data/scans/YYYY-MM-DD/<scan-id>.json)
+    const localScans = await this.readLocal<ScanItem[]>('scans.json', []);
+    if (localScans.length > 0) {
+      console.log(`[Migration] Migrating ${localScans.length} scans to immutable blob objects...`);
+      for (const scan of localScans) {
+        const datePart = scan.date || scan.timestamp?.split('T')[0] || new Date().toISOString().split('T')[0];
+        const scanBlobPath = `data/scans/${datePart}/${scan.scan_id}.json`;
+        await this.writeBlobJson(scanBlobPath, scan);
+      }
+      // Also save the monolithic backup copy for backward compatibility
+      await this.writeBlobJson('data/scans.json', localScans);
+      filesMigrated.push('scans.json');
+      counts.scans = localScans.length;
+    }
+
+    console.log('[Migration] Migration to Vercel Blob completed successfully.');
+    return {
+      migrated: true,
+      message: 'Migration from local JSON files to Vercel Blob completed successfully.',
+      filesMigrated,
+      counts,
+    };
   }
 
   // --- Storage Health & Diagnostics ---
@@ -610,17 +839,17 @@ export class JsonDatabase {
       appUrlStatus = 'missing';
     }
 
-    let modeDescription = 'Local Persistent JSON Database';
-    if (this.gcsBucketName) {
-      modeDescription = `Google Cloud Storage Synchronized (${this.gcsBucketName})`;
-    } else if (this.dataDir.startsWith('/mnt')) {
-      modeDescription = 'Google Cloud Run Volume Mount';
-    }
+    const isBlob = isBlobStorageConfigured();
+    const modeDescription = isBlob
+      ? 'Vercel Blob Storage (Private Blob JSON Objects)'
+      : 'Local Persistent JSON Database';
+
+    const directoryDescription = isBlob ? 'Vercel Blob Store (data/*)' : this.dataDir;
 
     return {
       storage_status: this.storageStatus,
       storage_mode: modeDescription,
-      storage_directory: this.dataDir,
+      storage_directory: directoryDescription,
       qr_records_count: qrs.length,
       scan_records_count: scans.length,
       campaigns_count: campaigns.length,
@@ -630,26 +859,41 @@ export class JsonDatabase {
       persistence_verified: this.storageStatus === 'Connected',
       app_url: settings.app_url || 'https://qr.aevyfragrance.com',
       app_url_status: appUrlStatus,
-      gcs_sync_enabled: Boolean(this.gcsBucketName),
-      gcs_bucket: this.gcsBucketName,
+      gcs_sync_enabled: false,
+      gcs_bucket: null,
+      blob_storage_enabled: isBlob,
     };
   }
 
   public async verifyStorageWriteRead(): Promise<{ success: boolean; testTimestamp: string; latencyMs: number }> {
-    const testFile = this.getFilePath('.persistence_verify.tmp');
     const start = Date.now();
     const testPayload = {
       verified_at: new Date().toISOString(),
       nonce: Math.random().toString(36),
     };
 
-    await fs.promises.writeFile(testFile, JSON.stringify(testPayload), 'utf-8');
-    const readBack = await fs.promises.readFile(testFile, 'utf-8');
-    const parsed = JSON.parse(readBack);
-    if (parsed.nonce !== testPayload.nonce) {
-      throw new Error('Persistence verification mismatch during readback');
+    if (isBlobStorageConfigured()) {
+      const testPath = 'data/.persistence_verify.json';
+      await this.writeBlobJson(testPath, testPayload);
+      const readBack = await this.readBlobJson<typeof testPayload>(testPath);
+      if (!readBack || readBack.nonce !== testPayload.nonce) {
+        throw new Error('Persistence verification mismatch during Vercel Blob readback');
+      }
+      try {
+        await del(testPath);
+      } catch {
+        // silent clean up
+      }
+    } else {
+      const testFile = this.getLocalFilePath('.persistence_verify.tmp');
+      await fs.promises.writeFile(testFile, JSON.stringify(testPayload), 'utf-8');
+      const readBack = await fs.promises.readFile(testFile, 'utf-8');
+      const parsed = JSON.parse(readBack);
+      if (parsed.nonce !== testPayload.nonce) {
+        throw new Error('Persistence verification mismatch during readback');
+      }
+      await fs.promises.unlink(testFile);
     }
-    await fs.promises.unlink(testFile);
 
     const latencyMs = Date.now() - start;
     this.lastSuccessfulWrite = new Date().toISOString();
@@ -682,25 +926,39 @@ export class JsonDatabase {
 
     // Auto-backup current state first
     const autoBackup = await this.getFullBackup();
-    const backupDir = path.join(this.dataDir, 'backups');
-    if (!fs.existsSync(backupDir)) {
-      fs.mkdirSync(backupDir, { recursive: true });
+    const backupTimestamp = Date.now();
+
+    if (isBlobStorageConfigured()) {
+      await this.writeBlobJson(`data/backups/pre_restore_${backupTimestamp}.json`, autoBackup);
+    } else {
+      const backupDir = path.join(this.dataDir, 'backups');
+      if (!fs.existsSync(backupDir)) {
+        fs.mkdirSync(backupDir, { recursive: true });
+      }
+      const autoBackupPath = path.join(backupDir, `pre_restore_${backupTimestamp}.json`);
+      fs.writeFileSync(autoBackupPath, JSON.stringify(autoBackup, null, 2), 'utf-8');
     }
-    const autoBackupPath = path.join(backupDir, `pre_restore_${Date.now()}.json`);
-    fs.writeFileSync(autoBackupPath, JSON.stringify(autoBackup, null, 2), 'utf-8');
 
     if (Array.isArray(data.qr_codes)) {
       await this.saveQRCodes(data.qr_codes);
       await this.migrateExistingQRCodes();
     }
     if (Array.isArray(data.scans)) {
-      await this.writeAtomic('scans.json', data.scans);
+      if (isBlobStorageConfigured()) {
+        for (const scan of data.scans) {
+          const datePart = scan.date || scan.timestamp?.split('T')[0] || new Date().toISOString().split('T')[0];
+          await this.writeBlobJson(`data/scans/${datePart}/${scan.scan_id}.json`, scan);
+        }
+        await this.writeBlobJson('data/scans.json', data.scans);
+      } else {
+        await this.writeLocalAtomic('scans.json', data.scans);
+      }
     }
     if (Array.isArray(data.campaigns)) {
       await this.saveCampaigns(data.campaigns);
     }
     if (Array.isArray(data.visitors)) {
-      await this.writeAtomic('visitors.json', data.visitors);
+      await this.writeData('visitors.json', data.visitors);
     }
     if (data.settings && typeof data.settings === 'object') {
       await this.updateSettings(data.settings);
@@ -728,11 +986,24 @@ export class JsonDatabase {
     const cutoffIso = cutoffDate.toISOString();
 
     const scans = await this.getScans();
+    const oldScans = scans.filter((s) => s.timestamp < cutoffIso);
     const keptScans = scans.filter((s) => s.timestamp >= cutoffIso);
-    const removedCount = scans.length - keptScans.length;
+    const removedCount = oldScans.length;
 
     if (removedCount > 0) {
-      await this.writeAtomic('scans.json', keptScans);
+      if (isBlobStorageConfigured()) {
+        for (const scan of oldScans) {
+          const datePart = scan.date || scan.timestamp?.split('T')[0] || new Date().toISOString().split('T')[0];
+          try {
+            await del(`data/scans/${datePart}/${scan.scan_id}.json`);
+          } catch {
+            // ignore
+          }
+        }
+        await this.writeBlobJson('data/scans.json', keptScans);
+      } else {
+        await this.writeLocalAtomic('scans.json', keptScans);
+      }
     }
     return removedCount;
   }

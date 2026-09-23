@@ -488,7 +488,11 @@ export const SettingsPage: React.FC = () => {
                 </div>
                 <div className="flex items-center justify-between text-[#555555]">
                   <span>Database Format:</span>
-                  <span className="font-medium text-[#111111]">Atomic JSON Files (Atomic Rename Journal)</span>
+                  <span className="font-medium text-[#111111]">
+                    {storageHealth?.blob_storage_enabled
+                      ? 'Private Vercel Blob (JSON Data Objects)'
+                      : 'Atomic JSON Files (Atomic Rename Journal)'}
+                  </span>
                 </div>
               </div>
 

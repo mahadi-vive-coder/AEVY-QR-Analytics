@@ -1,0 +1,17 @@
+{
+  "version": 2,
+  "rewrites": [
+    {
+      "source": "/q/:match*",
+      "destination": "/api/index"
+    },
+    {
+      "source": "/api/:match*",
+      "destination": "/api/index"
+    },
+    {
+      "source": "/((?!api/|q/).*)",
+      "destination": "/$1"
+    }
+  ]
+}

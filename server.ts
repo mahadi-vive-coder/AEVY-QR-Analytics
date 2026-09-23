@@ -12,9 +12,10 @@ import { campaignRouter } from './server/routes/campaignRoutes.js';
 import { visitorRouter } from './server/routes/visitorRoutes.js';
 import { dataRouter } from './server/routes/dataRoutes.js';
 import { settingsRouter } from './server/routes/settingsRoutes.js';
-import { JsonDatabase } from './server/services/jsonDatabase.js';
+import { JsonDatabase, isBlobStorageConfigured } from './server/services/jsonDatabase.js';
 import { seedInitialDataIfEmpty } from './server/services/seedService.js';
 import { getResolvedAppUrl } from './server/services/urlService.js';
+import { runMigrationIfNeeded } from './server/services/migrationService.js';
 
 dotenv.config();
 
@@ -24,10 +25,24 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const isProduction = process.env.NODE_ENV === 'production';
+const isVercel = Boolean(process.env.VERCEL || process.env.VERCEL_ENV);
 
-// Initialize JSON database (creates files if missing)
+// Initialize JSON database
 JsonDatabase.getInstance();
-seedInitialDataIfEmpty().catch(console.error);
+
+// Trigger migration if MIGRATION_MODE === 'true'
+if (process.env.MIGRATION_MODE === 'true') {
+  runMigrationIfNeeded()
+    .then((res) => {
+      console.log('[AEVY Migration]', res.message);
+    })
+    .catch((err) => {
+      console.error('[AEVY Migration Error]:', err);
+    });
+} else if (!isBlobStorageConfigured()) {
+  // Only seed demo data in local dev mode when no blob is configured
+  seedInitialDataIfEmpty().catch(console.error);
+}
 
 // Standard middlewares
 app.use(securityHeaders);
@@ -35,7 +50,7 @@ app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());
 
-// Trust proxy for proper IP resolution behind Cloud Run / reverse proxies
+// Trust proxy for proper IP resolution behind reverse proxies / Vercel Edge
 app.set('trust proxy', 1);
 
 // Mount dynamic QR tracking redirect & lead submission FIRST for peak speed
@@ -55,6 +70,7 @@ app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', brand: 'AEVY', time: new Date().toISOString() });
 });
 
+// Standalone server lifecycle for local development and non-Vercel environments
 async function startServer() {
   if (!isProduction) {
     // Development mode: Mount Vite dev server middleware
@@ -67,7 +83,7 @@ async function startServer() {
     });
     app.use(vite.middlewares);
   } else {
-    // Production mode: Serve built frontend assets
+    // Production standalone mode: Serve built frontend assets
     const distPath = path.resolve(__dirname, 'dist');
     app.use(express.static(distPath));
     app.get('*', (req, res) => {
@@ -89,6 +105,11 @@ async function startServer() {
   });
 }
 
-startServer().catch((err) => {
-  console.error('Failed to start server:', err);
-});
+// Do NOT call app.listen() when running on Vercel serverless environment
+if (!isVercel) {
+  startServer().catch((err) => {
+    console.error('Failed to start server:', err);
+  });
+}
+
+export default app;
