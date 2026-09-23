@@ -1,0 +1,6 @@
+{
+  "name": "AEVY QR Analytics",
+  "description": "Dynamic QR code tracking, analytics dashboard, and campaign management for AEVY luxury fragrance.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

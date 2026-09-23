@@ -1,0 +1,54 @@
+[
+  {
+    "id": "AEVY-QR-000005",
+    "name": "AEVY ELEGANCE TEST BOTTLE",
+    "campaign_id": "",
+    "product": "ELEGANCE NOIR",
+    "placement": "Bottle Neck Tag",
+    "description": "Gold foiled bottle neck tag",
+    "destination_url": "https://aevyfragrance.com/luxury-collection",
+    "status": "active",
+    "created_at": "2026-09-23T04:06:14.189Z",
+    "updated_at": "2026-09-23T04:06:14.189Z",
+    "start_date": null,
+    "expiry_date": null,
+    "scan_count": 1,
+    "enable_lead_capture": false,
+    "settings": {
+      "foreground": "#111111",
+      "background": "#FFFFFF",
+      "accent": "#C6A46A",
+      "error_correction": "H",
+      "margin": 2,
+      "size": 400,
+      "logo": null
+    },
+    "last_scanned_at": "2026-09-23T04:06:14.195Z"
+  },
+  {
+    "id": "AEVY-QR-000004",
+    "name": "AEVY SEAL STICKERS",
+    "campaign_id": "CAMP-000001",
+    "product": "ALL",
+    "placement": "STICKERS",
+    "description": "Packaging QR",
+    "destination_url": "https://www.facebook.com/aevy.fragrance",
+    "status": "active",
+    "created_at": "2026-09-23T03:40:07.006Z",
+    "updated_at": "2026-09-23T03:41:44.791Z",
+    "start_date": null,
+    "expiry_date": null,
+    "scan_count": 2,
+    "enable_lead_capture": false,
+    "settings": {
+      "foreground": "#111111",
+      "background": "#FFFFFF",
+      "accent": "#C6A46A",
+      "error_correction": "H",
+      "margin": 2,
+      "size": 400,
+      "logo": null
+    },
+    "last_scanned_at": "2026-09-23T04:05:42.292Z"
+  }
+]
